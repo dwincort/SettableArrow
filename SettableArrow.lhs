@@ -79,6 +79,9 @@ instance:
 > instance Functor Event where
 >   fmap f (Event a) = Event $ f a
 >   fmap _ NoEvent = NoEvent
+> isEvent :: Event a -> Bool
+> isEvent (Event _) = True
+> isEvent NoEvent = False
 
 We use the following merge function as in the paper, which gives 
 preference to the left argument.
@@ -330,11 +333,81 @@ properly loaded.
 
 
 -------------------------------------------------------------------------------
-- Above and beyond
+- Some functions from the paper
 
-I don't provide any examples of its use here, but as it's in the paper, I 
-will here provide the definition of pChoice.
+The paper makes uses of switching in order to compare non-interfering choice 
+and settability to it, but we have no concept of switching in our setup 
+here.  Therefore, we introduce a new Arrow type class to capture switching 
+solely for the purpose of crafting these programs.  A suitable extension to 
+SF could be made, but we refrain from that here.
 
+> class Arrow a => ArrowSwitch a where
+>   switch :: a b (c, Event t) -> (t -> (a b c)) -> a b c
+>   rSwitch :: a b c -> a (b, Event (a b c)) c
+>   pSwitch :: Functor col => col (a b c) -> a (b, col c) (Event t)
+>           -> (col (a b c) -> t -> a b (col c)) -> a b (col c)
+
+We also provide two helper functions:
+
+> constA :: Arrow a => c -> a b c
+> constA c = arr (const c)
+> 
+> integral :: (ArrowDelay a, ArrowLoop a) => a Double Double
+> integral = proc x -> do
+>   rec i <- delay 0 -< i + x * dt
+>   returnA -< i
+>  where dt = 1
+
+With this setup, we can write the three versions of integralWhen
+
+> integralWhenNaive :: (ArrowLoop a, ArrowDelay a) => a (Double, Bool) Double
+> integralWhenNaive = proc (i,b) -> do
+>   v <- integral -< i
+>   vPrev <- delay 0 -< v
+>   let vDelta = v - vPrev
+>   rec result <- delay 0 -< if b then result + vDelta else result
+>   returnA -< result
+> 
+> integralWhenSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Event Bool) Double
+> integralWhenSwitch = proc (i, eb) -> do
+>   rec v <- rSwitch (constA 0) -< (i,
+>             fmap (\b -> if b then (integral >>> arr (+v)) else (constA v)) eb)
+>   returnA -< v
+> 
+> integralWhenChoice :: (ArrowChoice a, ArrowDelay a, ArrowLoop a) => a (Double, Bool) Double
+> integralWhenChoice = proc (i,b) -> do
+>   rec v <- if b then integral -< i
+>                 else returnA -< v'
+>       v' <- delay 0 -< v
+>   returnA -< v
+
+as well as the three versions of integralReset
+
+> integralResetSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Event ()) Double
+> integralResetSwitch = proc (i,e) -> do
+>   rSwitch integral -< (i, fmap (const integral) e)
+> 
+> integralResetBasic :: (ArrowLoop a, ArrowDelay a) => a (Double, Event ()) Double
+> integralResetBasic = proc (i,e) -> do
+>   o <- integral -< i
+>   rec let k = if isEvent e then o else k'
+>       k' <- delay 0 -< k
+>   returnA -< o-k
+> 
+> integralReset :: (ArrowLoop a, ArrowDelay a, SettableArrow a) => a (Double, Event ()) Double
+> integralReset = proc (i,e) -> do
+>   (v,_) <- settable integral -< (i, fmap (const reset) e)
+>   returnA -< v
+
+and our functions that show off arrowized recursion:
+
+> runNTimes :: Arrow a => Int -> a b c -> a [b] [c]
+> runNTimes 0 _  = constA []
+> runNTimes n sf = proc (b:bs) -> do
+>   c  <- sf -< b
+>   cs <- runNTimes (n-1) sf -< bs
+>   returnA -< (c:cs)
+> 
 > runDynamic :: ArrowChoice a => a b c -> a [b] [c]
 > runDynamic sf = proc lst -> 
 >   case lst of
@@ -343,11 +416,25 @@ will here provide the definition of pChoice.
 >         c <- sf -< b
 >         cs <- runDynamic sf -< bs
 >         returnA -< c:cs
+
+-------------------------------------------------------------------------------
+- Choice-Based Implementations of Switch
+
+> switchChoice :: (ArrowLoop a, ArrowDelay a, ArrowChoice a) 
+>              => a b (c, Event t) -> a (Event t, b) c -> a b c
+> switchChoice sf1 sf2 = proc a -> do
+>   rec onOne <- delay True -< not onTwo
+>       (b, et) <- if onOne 
+>                  then sf1 -< a
+>                  else returnA -< (undefined, NoEvent)
+>       let onTwo = isEvent et || not onOne
+>   if onTwo then sf2 -< (et, a)
+>            else returnA -< b
 > 
 > pChoice :: (Typeable inp, Eq key, Eq uid, Typeable uid, 
 >             ArrowChoice a, ArrowLoop a, ArrowDelay a, SettableArrow a) => 
 >     [(key, a (Maybe inp) result)] -> a [(key, (uid, Maybe inp))] [result]
-> pChoice [] = arr . const $ [] --constA []
+> pChoice [] = constA []
 > pChoice ((key, sf):rst) = proc es -> do
 >     rec states <- delay [] -< newStates
 >         let esThis = map snd $ filter ((== key) . fst) es
@@ -359,4 +446,6 @@ will here provide the definition of pChoice.
 >   where update s [] = s
 >         update s ((uid, Nothing):rst) = update (filter ((/= uid) . snd) s) rst
 >         update s ((uid, i):rst) = update (((i, Event NoState), uid):s) rst
+
+
 
