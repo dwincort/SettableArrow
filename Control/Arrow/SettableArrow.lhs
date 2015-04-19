@@ -108,30 +108,24 @@ wrapped arrow.
 
 > instance Arrow a => Category (SA a) where
 >   id = SA $ arr $ \(b, _) -> (b, NoState)
->   (SA g) . (SA f) = SA $ proc (b,et) -> do
->     let (el,er) = split et
->     (c, t1) <- f -< (b, el)
->     (d, t2) <- g -< (c, er)
->     returnA -< (d, joinS t1 t2)
+>   (SA g) . (SA f) = SA $ 
+>     arr (\(b,et) -> (let (el,er) = split et in ((b,el),er))) >>>
+>     first f >>> arr (\((c,t1),er) -> ((c,er),t1)) >>> first g >>>
+>     arr (\((d,t2),t1) -> (d, joinS t1 t2))
 > 
 > instance Arrow a => Arrow (SA a) where
 >   arr f = SA $ arr $ \(b, _) -> (f b, NoState)
->   first (SA f) = SA $ proc ((b,d), et) -> do
->     (c, t) <- f -< (b, et)
->     returnA -< ((c,d), t)
->   second (SA f) = SA $ proc ((d,b), et) -> do
->     (c, t) <- f -< (b, et)
->     returnA -< ((d,c), t)
->   (SA f) *** (SA g) = SA $ proc ((b,b'), et) -> do
->     let (el,er) = split et
->     (c,  t1) <- f -< (b,  el)
->     (c', t2) <- g -< (b', er)
->     returnA -< ((c,c'), joinS t1 t2)
-> 
+>   first (SA f) = SA $ 
+>       arr (\((b,d), et) -> ((b,et),d)) >>> first f >>> arr (\((c,t), d) -> ((c,d),t))
+>   second (SA f) = SA $ 
+>       arr (\((d,b), et) -> (d,(b,et))) >>> second f >>> arr (\(d,(c,t)) -> ((d,c),t))
+>   (SA f) *** (SA g) = SA $ 
+>     arr (\((b,b'), et) -> (let (el,er) = split et in ((b,el),(b',er)))) >>>
+>     f *** g >>> arr (\((c,t1),(c',t2)) -> ((c,c'), joinS t1 t2))
+
 > instance ArrowLoop a => ArrowLoop (SA a) where
->   loop (SA f) = SA $ proc (b,et) -> do
->     rec ((c,d),t) <- f -< ((b,d),et)
->     returnA -< (c,t)
+>   loop (SA f) = SA $ loop $ 
+>       arr (\((b,et), d) -> ((b,d),et)) >>> f >>> arr (\((c,d), t) -> ((c,t),d))
 > 
 > instance (ArrowLoop a, ArrowChoice a, ArrowDelay a) => ArrowChoice (SA a) where
 >   left ~(SA f) = SA $ proc (bd, et) -> do
