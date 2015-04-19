@@ -6,35 +6,34 @@ Non-Interfering Signal Functions for FRP" (see citation below).
 As a sample instantiation of Arrow, we use a function automaton drawn 
 from the ArrowTransformers library.  We then set up the settability 
 data types and show the transformation as a set of type classes.  At the 
-bottom of this file, we provide some small demonstations.
+bottom of this file, we provide some small demonstrations.
 
 Winograd-Cort, Daniel and Hudak, Paul. Settable and Non-Interfering Signal Functions for FRP. In: International Conference on Functional Programming. ACM, September 2014.
 
 -------------------------------------------------------------------------------
 
 Obviously, we'll be using arrow syntax, and as such, we need to enable GHC's 
-arrow syntax language pragma.  We also will be making use of the Typeable and 
-Dynamic features, so we enable Typeable deriving for data types.  Beyond that, 
+arrow syntax language pragma.  Beyond that, 
 we use type synonym instances and flexible instances in order to easily adapt 
 the Automaton type for our use, and we throw in tuple sections because they're 
 nice.
 
-> {-# LANGUAGE Arrows, DeriveDataTypeable #-}
+> {-# LANGUAGE Arrows #-}
 > {-# LANGUAGE TypeSynonymInstances, FlexibleInstances #-}
 > {-# LANGUAGE TupleSections #-}
 
 We import:
-- Arrow and Category to instantiate their type classes
-- Dynamic for use with the State type
+- Arrow and SettableArrow for obvious reasons
+- Dynamic to have the Typeable constraint
 - Automaton, Stream, and Arrow Operations for use as our sample Arrow instance
 
-> import Prelude hiding (id, (.))
-> import Control.Category
 > import Control.Arrow
-> import Data.Dynamic (Typeable, Dynamic(..), toDyn, fromDyn)
+> import Control.Arrow.SettableArrow
+> import Data.Dynamic (Typeable)
 > import Control.Arrow.Transformer.Automaton
 > import qualified Data.Stream as S (toList, fromList)
 > import qualified Control.Arrow.Operations as OPS (delay)
+> import Data.Maybe (isJust)
 
 -------------------------------------------------------------------------------
 - The SF type
@@ -46,17 +45,6 @@ be creating objects of this type with arrow syntax anyway, so there's no
 need to force us to wrap them by using, say, newtype.
 
 > type SF = Automaton (->)
-
-The arrows package (Control.Arrow.Operations in particular) has a delay 
-operator that comes in the ArrowCircuit type class.  However, for our 
-purposes, we require that the type of delay enforces a Typeable constraint 
-on the delayable values.  Thus, we create a new ArrowDelay class:
-
-> class Arrow a => ArrowDelay a where
->   delay :: Typeable b => b -> a b b
-
-and we use it to wrap ArrowCircuit's delay:
-
 > instance ArrowDelay SF where
 >   delay i = OPS.delay i
 
@@ -67,114 +55,6 @@ this can cause errors.)
 > runSF :: SF b c -> [b] -> [c]
 > runSF sf inp = S.toList $ runAutomaton (arr snd >>> sf) ((), S.fromList inp)
 
--------------------------------------------------------------------------------
-- Events
-
-Events are an option type, but to maintain consistency with code in the 
-paper, we create a new data type for them with an accompanying Functor 
-instance:
-
-> data Event a = NoEvent | Event a
->   deriving (Eq, Show, Typeable)
-> instance Functor Event where
->   fmap f (Event a) = Event $ f a
->   fmap _ NoEvent = NoEvent
-> isEvent :: Event a -> Bool
-> isEvent (Event _) = True
-> isEvent NoEvent = False
-
-We use the following merge function as in the paper, which gives 
-preference to the left argument.
-
-> mergeE :: Event a -> Event a -> Event a
-> mergeE NoEvent t = t
-> mergeE e _ = e
-
--------------------------------------------------------------------------------
-- State
-
-Before we can define settability, we must define the State type that controls 
-the settable behavior.  This is exactly as outlined in the paper:
-
-> data State = NoState
->            | DState Dynamic
->            | PairState State State
->   deriving (Show, Typeable)
-
-The reset state is a special state that can always be given as an argument 
-to any settable arrow and resets it to its default state
-
-> reset :: State
-> reset = NoState
-
-We can also split a State Event into its components
-
-> split :: Event State -> (Event State, Event State)
-> split NoEvent                 = (NoEvent, NoEvent)
-> split (Event NoState)         = (Event NoState, Event NoState)
-> split (Event (PairState l r)) = (Event l, Event r)
-> split (Event (DState _)) = error $ "Tried to split a DState"
-
--------------------------------------------------------------------------------
-- Settable Arrow
-
-Finally, we are able to define our SettableArrow class:
-
-> class SettableArrow a where
->   settable :: a b c -> a (b, Event State) (c, State)
-
-and along with it, the SettableArrow wrapper data type that we will use to 
-perform our transformation:
-
-> data SA a b c = SA (a (b, Event State) (c, State))
-
-What follows are the instances of the various Arrow classes for an SA 
-wrapped arrow.
-
-> instance Arrow a => Category (SA a) where
->   id = SA $ arr $ \(b, _) -> (b, NoState)
->   (SA g) . (SA f) = SA $ proc (b,et) -> do
->     let (el,er) = split et
->     (c, t1) <- f -< (b, el)
->     (d, t2) <- g -< (c, er)
->     returnA -< (d, PairState t1 t2)
-> 
-> instance Arrow a => Arrow (SA a) where
->   arr f = SA $ arr $ \(b, _) -> (f b, NoState)
->   first (SA f) = SA $ proc ((b,d), et) -> do
->     (c, t) <- f -< (b, et)
->     returnA -< ((c,d), t)
-> 
-> instance ArrowLoop a => ArrowLoop (SA a) where
->   loop (SA f) = SA $ proc (b,et) -> do
->     rec ((c,d),t) <- f -< ((b,d),et)
->     returnA -< (c,t)
-> 
-> instance (ArrowLoop a, ArrowChoice a, ArrowDelay a) => ArrowChoice (SA a) where
->   left ~(SA f) = SA $ proc (bd, et) -> do
->     rec (oldState, pendingUpdate) <- delay (NoState, NoEvent) -< (newState, newUpdate)
->         let thisUpdate = mergeE et pendingUpdate
->         (newState, newUpdate, cd) <- case bd of
->             Left b  -> do
->                 (c,t) <- f -< (b, thisUpdate)
->                 returnA -< (t, NoEvent, Left c)
->             Right d -> returnA -< (oldState, thisUpdate, Right d)
->     returnA -< (cd, newState)
-> 
-> instance ArrowDelay a => ArrowDelay (SA a) where
->   delay i = SA $ proc (tnew,et) -> do
->     told <- delay i -< tnew
->     returnA -< (f told et, DState (toDyn tnew))
->    where f s NoEvent = s
->          f _ (Event NoState) = i
->          f _ (Event (DState d)) = fromDyn d (error "bad Dynamic")
->          f _ (Event (PairState _ _)) = error "delay given PairState."
-> 
-> instance (Arrow a, ArrowDelay a) => SettableArrow (SA a) where
->   settable (SA f) = SA $ proc ((b, et), et') -> do
->     (c,t) <- f -< (b, mergeE et' et)
->     returnA -< ((c,t), t)
-
 
 -------------------------------------------------------------------------------
 - Running a Settable Arrow
@@ -183,7 +63,7 @@ We'll make two convenience functions for dealing with specifically settable
 arrows.  First, we provide:
 
 > runS :: SA SF b c -> [b] -> [c]
-> runS (SA f) xs = map fst $ runSF f (map (,NoEvent) xs)
+> runS (SA f) xs = map fst $ runSF f (map (,Nothing) xs)
 
 This runS function will take settable-wrapped SF and ignores all 
 State inputs and outputs.  This should behave exactly as an 
@@ -193,9 +73,9 @@ Our second convenience function will provide an easy way to store, load, or
 reset the state of our signal function.  Rather than having to manually 
 handle the state, this function will accept both the input stream as well as 
 a "Control" stream to drive the settability:
-- The default value is None, which will provide NoEvent as input and ignore 
+- The default value is None, which will provide Nothing as input and ignore 
   the outputs.
-- The Store value will still provide NoEvent as the input, but it will capture 
+- The Store value will still provide Nothing as the input, but it will capture 
   the output state to be used later.  Initially, the stored value is reset.
 - The Load value will used the stored state as the input to the settable arrow.
 - The Reset value will reset the settable arrow to its initial state.
@@ -205,12 +85,12 @@ a "Control" stream to drive the settability:
 > runS' :: SA SF b c -> [(b, Control)] -> [c]
 > runS' (SA f) bcs = 
 >     let out = runSF f inp
->         inp = foo (Event reset) bcs out
+>         inp = foo (Just reset) bcs out
 >         foo _ [] _ = []
->         foo saved ((b, None):bs) outs = (b,NoEvent):(foo saved bs (tail outs))
->         foo saved ((b, Store):bs) outs = (b,NoEvent):(foo (Event $ snd $ head outs) bs (tail outs))
+>         foo saved ((b, None):bs) outs = (b,Nothing):(foo saved bs (tail outs))
+>         foo saved ((b, Store):bs) outs = (b,Nothing):(foo (Just $ snd $ head outs) bs (tail outs))
 >         foo saved ((b, Load):bs) outs = (b,saved):(foo saved bs (tail outs))
->         foo saved ((b, Reset):bs) outs = (b,(Event reset)):(foo saved bs (tail outs))
+>         foo saved ((b, Reset):bs) outs = (b,(Just reset)):(foo saved bs (tail outs))
 >     in map fst out
 
 -------------------------------------------------------------------------------
@@ -256,8 +136,8 @@ example, we will pipe the state of the first counter into the second:
 > twoCounters' :: (SettableArrow a, ArrowLoop a, ArrowDelay a) => a () (Int,Int)
 > twoCounters' = proc _ -> do
 >   rec s0 <- delay reset -< s2
->       (x,s1) <- settable counter -< ((), Event s0)
->       (y,s2) <- settable counter -< ((), Event s1)
+>       (x,s1) <- settable counter -< ((), Just s0)
+>       (y,s2) <- settable counter -< ((), Just s1)
 >   returnA -< (x,y)
 > 
 > testTC2 = take 5 $ runS twoCounters' $ repeat ()
@@ -342,9 +222,9 @@ solely for the purpose of crafting these programs.  A suitable extension to
 SF could be made, but we refrain from that here.
 
 > class Arrow a => ArrowSwitch a where
->   switch :: a b (c, Event t) -> (t -> (a b c)) -> a b c
->   rSwitch :: a b c -> a (b, Event (a b c)) c
->   pSwitch :: Functor col => col (a b c) -> a (b, col c) (Event t)
+>   switch :: a b (c, Maybe t) -> (t -> (a b c)) -> a b c
+>   rSwitch :: a b c -> a (b, Maybe (a b c)) c
+>   pSwitch :: Functor col => col (a b c) -> a (b, col c) (Maybe t)
 >           -> (col (a b c) -> t -> a b (col c)) -> a b (col c)
 
 We also provide two helper functions:
@@ -368,7 +248,7 @@ With this setup, we can write the three versions of integralWhen
 >   rec result <- delay 0 -< if b then result + vDelta else result
 >   returnA -< result
 > 
-> integralWhenSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Event Bool) Double
+> integralWhenSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Maybe Bool) Double
 > integralWhenSwitch = proc (i, eb) -> do
 >   rec v <- rSwitch (constA 0) -< (i,
 >             fmap (\b -> if b then (integral >>> arr (+v)) else (constA v)) eb)
@@ -383,18 +263,18 @@ With this setup, we can write the three versions of integralWhen
 
 as well as the three versions of integralReset
 
-> integralResetSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Event ()) Double
+> integralResetSwitch :: (ArrowLoop a, ArrowDelay a, ArrowSwitch a) => a (Double, Maybe ()) Double
 > integralResetSwitch = proc (i,e) -> do
 >   rSwitch integral -< (i, fmap (const integral) e)
 > 
-> integralResetBasic :: (ArrowLoop a, ArrowDelay a) => a (Double, Event ()) Double
+> integralResetBasic :: (ArrowLoop a, ArrowDelay a) => a (Double, Maybe ()) Double
 > integralResetBasic = proc (i,e) -> do
 >   o <- integral -< i
->   rec let k = if isEvent e then o else k'
+>   rec let k = if isJust e then o else k'
 >       k' <- delay 0 -< k
 >   returnA -< o-k
 > 
-> integralReset :: (ArrowLoop a, ArrowDelay a, SettableArrow a) => a (Double, Event ()) Double
+> integralReset :: (ArrowLoop a, ArrowDelay a, SettableArrow a) => a (Double, Maybe ()) Double
 > integralReset = proc (i,e) -> do
 >   (v,_) <- settable integral -< (i, fmap (const reset) e)
 >   returnA -< v
@@ -421,13 +301,13 @@ and our functions that show off arrowized recursion:
 - Choice-Based Implementations of Switch
 
 > switchChoice :: (ArrowLoop a, ArrowDelay a, ArrowChoice a) 
->              => a b (c, Event t) -> a (Event t, b) c -> a b c
+>              => a b (c, Maybe t) -> a (Maybe t, b) c -> a b c
 > switchChoice sf1 sf2 = proc a -> do
 >   rec onOne <- delay True -< not onTwo
 >       (b, et) <- if onOne 
 >                  then sf1 -< a
->                  else returnA -< (undefined, NoEvent)
->       let onTwo = isEvent et || not onOne
+>                  else returnA -< (undefined, Nothing)
+>       let onTwo = isJust et || not onOne
 >   if onTwo then sf2 -< (et, a)
 >            else returnA -< b
 > 
@@ -440,12 +320,12 @@ and our functions that show off arrowized recursion:
 >         let esThis = map snd $ filter ((== key) . fst) es
 >             inputStates = update states esThis
 >         output <- runDynamic (first (settable sf)) -< inputStates
->         let newStates = map (\ ((_, s), uid) -> ((Nothing, Event s), uid)) output
+>         let newStates = map (\ ((_, s), uid) -> ((Nothing, Just s), uid)) output
 >     rs <- pChoice rst -< es
 >     returnA -< (map (fst . fst) output) ++ rs
 >   where update s [] = s
 >         update s ((uid, Nothing):rst) = update (filter ((/= uid) . snd) s) rst
->         update s ((uid, i):rst) = update (((i, Event NoState), uid):s) rst
+>         update s ((uid, i):rst) = update (((i, Just reset), uid):s) rst
 
 
 

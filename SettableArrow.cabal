@@ -1,0 +1,22 @@
+name:           SettableArrow
+version:        0.1.0.0
+Cabal-Version:  >= 1.8
+license:        BSD3
+license-file:   License
+copyright:      Copyright (c) 2015 Daniel Winograd-Cort
+category:       Utility
+stability:      experimental
+build-type:     Simple
+author:         Dan Winograd-Cort <dwc@cs.yale.edu>
+maintainer:     Dan Winograd-Cort <dwc@cs.yale.edu>
+bug-reports:    https://github.com/dwincort/SettableArrow/issues
+homepage:       http://haskell.cs.yale.edu/
+synopsis:       Arrow extension to include settability
+description:    The Settable Arrow package provides settability for arrows.
+extra-source-files:
+  ReadMe.txt, Example.lhs
+
+Library
+   hs-source-dirs:   .
+   exposed-modules:  Control.Arrow.SettableArrow
+   build-depends:    base >= 4 && < 5
