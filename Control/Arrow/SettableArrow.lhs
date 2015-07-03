@@ -11,7 +11,7 @@ Obviously, we'll be using arrow syntax, and as such, we need to enable GHC's
 arrow syntax language pragma.  We also will be making use of the Typeable and 
 Dynamic features, so we enable Typeable deriving for data types.
 
-> {-# LANGUAGE Arrows, DeriveDataTypeable #-}
+> {-# LANGUAGE DeriveDataTypeable, RecursiveDo #-}
 
 The module will export the SA type we create as well as the State type.  
 However, the State type does not come with constructors.
@@ -19,7 +19,7 @@ However, the State type does not come with constructors.
 > module Control.Arrow.SettableArrow (
 >   ArrowDelay(..), SettableArrow(..), SA(..),
 >   State, reset, 
->   unsafeSA
+>   uncheckedSA
 > ) where
 
 We import:
@@ -95,13 +95,14 @@ and along with it, the SettableArrow wrapper data type that we will use to
 perform our transformation:
 
 > newtype SA a b c = SA (a (b, Maybe State) (c, State))
+>   deriving Typeable
 
 If we have a base arrow that we need to lift into the SA type and we 
 know that there are no settable components within that base arrow, 
 then we can use the following helper function:
 
-> unsafeSA :: Arrow a => a b c -> SA a b c
-> unsafeSA a = SA $ a *** (arr $ const NoState)
+> uncheckedSA :: Arrow a => a b c -> SA a b c
+> uncheckedSA a = SA $ a *** (arr $ const NoState)
 
 What follows are the instances of the various Arrow classes for an SA 
 wrapped arrow.
@@ -128,24 +129,36 @@ wrapped arrow.
 >       arr (\((b,et), d) -> ((b,d),et)) >>> f >>> arr (\((c,d), t) -> ((c,t),d))
 > 
 > instance (ArrowLoop a, ArrowChoice a, ArrowDelay a) => ArrowChoice (SA a) where
->   left ~(SA f) = SA $ proc (bd, et) -> do
->     rec (oldState, pendingUpdate) <- delay (NoState, Nothing) -< (newState, newUpdate)
->         let thisUpdate = mergeE et pendingUpdate
->         (newState, newUpdate, cd) <- case thisUpdate `seq` bd of
->             Left b  -> do
->                 (c,t) <- f -< (b, thisUpdate)
->                 returnA -< (t, Nothing, Left c)
->             Right d -> returnA -< (oldState, thisUpdate, Right d)
->     returnA -< (cd, newState)
->   right ~(SA f) = SA $ proc (db, et) -> do
->     rec (oldState, pendingUpdate) <- delay (NoState, Nothing) -< (newState, newUpdate)
->         let thisUpdate = mergeE et pendingUpdate
->         (newState, newUpdate, dc) <- case thisUpdate `seq` db of
->             Right b  -> do
->                 (c,t) <- f -< (b, thisUpdate)
->                 returnA -< (t, Nothing, Right c)
->             Left d -> returnA -< (oldState, thisUpdate, Left d)
->     returnA -< (dc, newState)
+>   left ~(SA f) = SA $ loop $ 
+>       second (delay (NoState, Nothing)) >>>
+>       arr (\((bd,et),(oldState,pendingUpdate)) -> let thisUpdate = mergeE et pendingUpdate in
+>            thisUpdate `seq` either (\b -> Left (b,thisUpdate)) 
+>                                    (\d -> Right ((d,oldState),(oldState, thisUpdate))) bd) >>>
+>       left f >>> arr (either (\(c,t) -> ((Left c,t),(t,Nothing))) (\((d,s),y) -> ((Right d,s),y)))
+>   -- proc (bd, et) -> do
+>   --  rec (oldState, pendingUpdate) <- delay (NoState, Nothing) -< (newState, newUpdate)
+>   --      let thisUpdate = mergeE et pendingUpdate
+>   --      (newState, newUpdate, cd) <- case thisUpdate `seq` bd of
+>   --          Left b  -> do
+>   --              (c,t) <- f -< (b, thisUpdate)
+>   --              returnA -< (t, Nothing, Left c)
+>   --          Right d -> returnA -< (oldState, thisUpdate, Right d)
+>   --  returnA -< (cd, newState)
+>   right ~(SA f) = SA $ loop $ 
+>       second (delay (NoState, Nothing)) >>>
+>       arr (\((db,et),(oldState,pendingUpdate)) -> let thisUpdate = mergeE et pendingUpdate in
+>            thisUpdate `seq` either (\d -> Left ((d,oldState),(oldState, thisUpdate))) 
+>                                    (\b -> Right (b,thisUpdate)) db) >>>
+>       right f >>> arr (either (\((d,s),y) -> ((Left d,s),y)) (\(c,t) -> ((Right c,t),(t,Nothing))))
+>   -- proc (db, et) -> do
+>   --  rec (oldState, pendingUpdate) <- delay (NoState, Nothing) -< (newState, newUpdate)
+>   --      let thisUpdate = mergeE et pendingUpdate
+>   --      (newState, newUpdate, dc) <- case thisUpdate `seq` db of
+>   --          Right b  -> do
+>   --              (c,t) <- f -< (b, thisUpdate)
+>   --              returnA -< (t, Nothing, Right c)
+>   --          Left d -> returnA -< (oldState, thisUpdate, Left d)
+>   --  returnA -< (dc, newState)
 > 
 > instance ArrowDelay a => ArrowDelay (SA a) where
 >   delay i = SA $ first (delay i &&& id) >>> arr (\((told,tnew),et) -> (f told et, DState (toDyn tnew)))
@@ -158,9 +171,36 @@ wrapped arrow.
 >          f _ (Just (PairState _ _)) = error "delay given PairState."
 > 
 > instance (Arrow a, ArrowDelay a) => SettableArrow (SA a) where
->   settable (SA f) = SA $ proc ((b, et), et') -> do
->     (c,t) <- f -< (b, mergeE et' et)
->     returnA -< ((c,t), t)
+>   settable (SA f) = SA $ 
+>       arr (\((b, et), et') -> (b, mergeE et' et)) >>> f >>> arr (\(c,t) -> ((c,t),t))
+>   -- proc ((b, et), et') -> do
+>   --  (c,t) <- f -< (b, mergeE et' et)
+>   --  returnA -< ((c,t), t)
 
 
 
+> -- This class represents arrows with a repeating switch that triggers 
+> -- immediately (much like Yampa's rswitch)
+> class Arrow a => ArrowSwitch a where
+>   switch :: (Typeable b, Typeable c) => a b c -> a (b, Maybe (a b c)) c
+> 
+> instance (Typeable a, ArrowSwitch a, ArrowLoop a, ArrowDelay a) => ArrowSwitch (SA a) where
+>   switch (SA def) = SA $ loop $ 
+>     second (delay def) >>> arr (\(((b,msf),et),prevSF) -> 
+>       let (esf,edata) = split et
+>           thisSF = getSF msf esf
+>           prevSF' = maybe prevSF id thisSF
+>       in (((b, edata), thisSF), prevSF')) >>>
+>     first (switch def) >>> arr (\((c,s),prevSF') -> ((c, joinS (DState (toDyn prevSF')) s), prevSF'))
+>   -- proc ((b,msf),et) -> do
+>   --  rec prevSF <- delay def -< prevSF'
+>   --      let (esf,edata) = split et
+>   --          thisSF = getSF msf esf
+>   --          prevSF' = maybe prevSF id thisSF
+>   --  (c,s) <- switch def -< ((b, edata), thisSF)
+>   --  returnA -< (c, joinS (DState (toDyn prevSF')) s)
+>    where getSF (Just (SA sf)) _ = Just sf
+>          getSF Nothing Nothing = Nothing
+>          getSF Nothing (Just NoState) = Just def
+>          getSF Nothing (Just (DState d)) = Just $ fromDyn d (error "bad Dynamic")
+>          getSF Nothing (Just (PairState _ _)) = error "delay given PairState."
